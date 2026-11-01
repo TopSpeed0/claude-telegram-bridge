@@ -12,7 +12,7 @@
 // Usage:
 //   node scripts/leak-scan.js              tracked files as they are on disk
 //   node scripts/leak-scan.js --rev <sha>  every file in that commit
-//   node scripts/leak-scan.js --history    every line ever added, in all commits and messages
+//   node scripts/leak-scan.js --history    every line ever added, in all branch and tag commits and messages
 //   node scripts/leak-scan.js --pre-push   the commits being pushed (git hook; refs on stdin)
 // Exit code 1 when something is found.
 
@@ -96,7 +96,8 @@ if (mode === '--tree') {
     scanText(`${rev}:${f}`, git('show', `${rev}:${f}`));
   }
 } else if (mode === '--history') {
-  scanCommits(['--all']);
+  // Branches and tags only: local tool refs (stashes, agent checkpoints) are never pushed.
+  scanCommits(['--branches', '--tags']);
 } else if (mode === '--pre-push') {
   const zero = /^0+$/;
   for (const line of fs.readFileSync(0, 'utf8').split('\n').filter(Boolean)) {
