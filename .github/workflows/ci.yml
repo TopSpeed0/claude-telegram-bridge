@@ -32,6 +32,9 @@ jobs:
       - name: Every JavaScript file loads
         run: for f in mcp/*.js .github/smoke/*.js test/*.js; do node --check "$f" || exit 1; done
 
+      - name: No secrets in tracked files
+        run: node scripts/leak-scan.js --tree
+
       - name: Unit tests
         run: node --test test/*.test.js
 

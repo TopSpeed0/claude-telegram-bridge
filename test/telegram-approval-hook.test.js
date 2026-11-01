@@ -8,7 +8,7 @@ const shell = (command, tool = 'PowerShell') => classify(tool, { command }, []);
 
 test('asks before commands that change or send something', () => {
   for (const command of [
-    "Send-OutlookMail -To 'a@b.com' -Subject x -Body y -Send",
+    "Send-OutlookMail -To 'a@b.com' -Subject x -Body y -Send", // leak-scan:allow (fake address)
     "Send-OutlookReply -EntryID $id -Body '<p>ok</p>' -ReplyAll -Send",
     'oc apply -k deploy/app',
     'kubectl delete pod x -n y',
@@ -29,7 +29,7 @@ test('asks before commands that change or send something', () => {
 test('lets reads, drafts and local work through', () => {
   for (const command of [
     'Get-OutlookMail -From Alice -Count 10',
-    "Send-OutlookMail -To 'a@b.com' -Subject x -Body y",
+    "Send-OutlookMail -To 'a@b.com' -Subject x -Body y", // leak-scan:allow (fake address)
     'oc get pods -A',
     'kubectl describe node w1',
     'git status --short',

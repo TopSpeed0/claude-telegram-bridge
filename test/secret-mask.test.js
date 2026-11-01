@@ -24,16 +24,16 @@ test('hides headers, URL credentials and JSON fields', () => {
   const out = hidden('curl -H "Authorization: Bearer eyabc.def.ghi123" -X POST https://x', 'eyabc.def.ghi123');
   assert.match(out, /Authorization: Bearer \[REDACTED\]/, 'the scheme stays readable');
   hidden("iwr https://x -Headers @{ 'X-Api-Key' = 'k-999' }", 'k-999');
-  hidden('git clone https://bob:hunter2@git.example.com/r.git', 'hunter2');
+  hidden('git clone https://bob:hunter2@git.example.com/r.git', 'hunter2'); // leak-scan:allow (fake secret)
   hidden('mcp__x__create_user {"name":"a","password":"p@ss\\"w"}', 'p@ss');
   hidden('mcp__x__login {"client_secret":"cs-1","user":"u"}', 'cs-1');
 });
 
 test('hides well-known token formats anywhere', () => {
-  hidden('echo sk-ant-api03-abcdefghijklmnop', 'sk-ant-api03-abcdefghijklmnop');
-  hidden('use ghp_abcdefghijklmnopqrstuvwxyz0123', 'ghp_abcdefghijklmnopqrstuvwxyz0123');
-  hidden('bot 1234567890:AAHmyGODooBaiUUACdoodequCEv1F5FmF3c here', 'AAHmyGODooBaiUUACdoodequCEv1F5FmF3c');
-  hidden('key AKIAABCDEFGHIJKLMNOP', 'AKIAABCDEFGHIJKLMNOP');
+  hidden('echo sk-ant-api03-abcdefghijklmnop', 'sk-ant-api03-abcdefghijklmnop'); // leak-scan:allow (fake secret)
+  hidden('use ghp_abcdefghijklmnopqrstuvwxyz0123', 'ghp_abcdefghijklmnopqrstuvwxyz0123'); // leak-scan:allow (fake secret)
+  hidden('bot 1234567890:AAHmyGODooBaiUUACdoodequCEv1F5FmF3c here', 'AAHmyGODooBaiUUACdoodequCEv1F5FmF3c'); // leak-scan:allow (fake secret)
+  hidden('key AKIAABCDEFGHIJKLMNOP', 'AKIAABCDEFGHIJKLMNOP'); // leak-scan:allow (fake secret)
 });
 
 test('leaves ordinary commands alone', () => {

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Blocks a push that would publish a secret or a private name: scans the
+# authors, messages and added lines of every commit being pushed.
+# Enable once per clone: git config core.hooksPath .githooks
+exec node "$(git rev-parse --show-toplevel)/scripts/leak-scan.js" --pre-push

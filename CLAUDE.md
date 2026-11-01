@@ -63,6 +63,10 @@ Creates Windows Start Menu + Desktop shortcuts for one-click daemon launch.
   . $PROFILE; . <path-to-your-functions.ps1>; <your command>
   ```
 
+## Leak check before every push (public repo)
+
+This repo is public. Before any `git push`, run `node scripts/leak-scan.js` (tracked files) and fix every finding; the pre-push hook (`.githooks/pre-push`, enabled with `git config core.hooksPath .githooks`) then scans the authors, messages and added lines of the commits being pushed and blocks the push on a hit. Never bypass it with `--no-verify`. Built-in rules catch tokens, keys, private IPs, real e-mail addresses and Windows profile paths; your own company, host, cluster and people names go in the private list `.git/leak-patterns.txt` (one regex per line, never committed). Use made-up names in examples and tests (`nas-prd`, `vol_applog`), and mark a deliberately fake secret in a test with `leak-scan:allow`.
+
 ## Corporate TLS / Proxy
 
 If your organization intercepts TLS (MITM proxy), Node.js will fail HTTPS calls because it bundles its own CA store. Fix: add `--use-system-ca` to the node args in `.mcp.json`:
@@ -111,7 +115,7 @@ This requires Node.js 22.15+. PowerShell/curl already use the OS cert store and 
 
 **Correct:**
 ```
-stdout = 🗄️ **nas-prd: 10 volumes**
+stdout = 🗄️ **Netapp-Cluster: 10 volumes**
 | Volume | SVM | Used |
 |---|---|---|
 | vol_applog | prod | 91% 🔴 |

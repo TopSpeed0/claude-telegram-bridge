@@ -46,4 +46,6 @@ Thumbs.db
 .vscode/
 .claude-queue.json
 *.tmp
-nas-dr-dashboard.html
+
+# Python bytecode
+__pycache__/

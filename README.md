@@ -183,6 +183,7 @@ Claude writes its final answer as plain Markdown and the daemon delivers it (str
 
 - **Add your own tools**: Edit `CLAUDE.md` with domain-specific instructions
 - **Add a workspace profile**: Create `profile1.ps1` with custom PowerShell functions, reference it in `CLAUDE.md`
+- **Contributing**: run `git config core.hooksPath .githooks` once; the pre-push hook runs `scripts/leak-scan.js` so no secret or private name gets pushed
 - **Corporate proxy/TLS**: Add `--use-system-ca` to Node args in `.mcp.json` (requires Node 22.15+)
 - **Other platforms**: see [Platform support](#platform-support)
 
