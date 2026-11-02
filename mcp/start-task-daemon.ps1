@@ -108,13 +108,16 @@ if ($existing) {
 # keeps pointing at a dead PID. The daemon treats a PID it cannot signal as alive,
 # so once Windows recycles that number onto someone else's process the next start
 # aborts with "another daemon is already running". Clear the lock unless a real
-# daemon still holds it.
+# daemon still holds it. Match any path to the daemon script, not just ours: a
+# daemon started through a junction (C:\Users\<you>\Documents -> OneDrive) is
+# this folder's daemon too, and clearing its lock would start a second poller.
 $lockFile = Join-Path $repo '.telegram-task-daemon.lock'
 if (Test-Path $lockFile) {
   $lockPid = (Get-Content $lockFile -Raw).Trim()
   $holder = $null
   if ($lockPid -match '^\d+$') {
-    $holder = Get-OwnDaemon | Where-Object { "$($_.ProcessId)" -eq $lockPid }
+    $holder = Get-CimInstance Win32_Process -Filter "ProcessId=$lockPid" -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'telegram-task-daemon\.js' }
   }
   if (-not $holder) {
     Write-Host "Clearing stale lock (PID=$lockPid is not a running daemon)" -ForegroundColor Yellow
@@ -122,14 +125,17 @@ if (Test-Path $lockFile) {
   }
 }
 
-# Pull credentials from .mcp.json so we don't duplicate config.
-$mcp = Get-Content (Join-Path $repo '.mcp.json') -Raw | ConvertFrom-Json
-$tg = $mcp.mcpServers.'telegram-tg'.env
-if (-not $tg.TELEGRAM_BOT_TOKEN -or -not $tg.TELEGRAM_CHAT_ID) {
-  throw "telegram-tg env not found in .mcp.json"
+# Credentials: real values in .mcp.json win; with the YOUR_... placeholders (or no
+# .mcp.json) the daemon reads .telegram-config itself.
+$mcpFile = Join-Path $repo '.mcp.json'
+$tg = if (Test-Path $mcpFile) { (Get-Content $mcpFile -Raw | ConvertFrom-Json).mcpServers.'telegram-tg'.env }
+$real = { param($v) $v -and $v -notmatch '^YOUR_' }
+if ((& $real $tg.TELEGRAM_BOT_TOKEN) -and (& $real $tg.TELEGRAM_CHAT_ID)) {
+  $env:TELEGRAM_BOT_TOKEN = $tg.TELEGRAM_BOT_TOKEN
+  $env:TELEGRAM_CHAT_ID   = $tg.TELEGRAM_CHAT_ID
+} elseif (-not (Test-Path (Join-Path $repo '.telegram-config'))) {
+  throw "No Telegram credentials: put them in .telegram-config (run mcp/setup.ps1) or .mcp.json"
 }
-$env:TELEGRAM_BOT_TOKEN = $tg.TELEGRAM_BOT_TOKEN
-$env:TELEGRAM_CHAT_ID   = $tg.TELEGRAM_CHAT_ID
 
 # Generate the daemon MCP config from this repo's private connector registry.
 & node (Join-Path $PSScriptRoot 'sync-mcp-connectors.js') claude

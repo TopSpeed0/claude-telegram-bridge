@@ -91,7 +91,9 @@ function log(msg) {
 function loadConfig() {
   const envToken = process.env.TELEGRAM_BOT_TOKEN;
   const envChat  = process.env.TELEGRAM_CHAT_ID;
-  if (envToken && envChat) return { bot_token: envToken, chat_id: envChat };
+  // .mcp.json may hold the YOUR_... placeholders so the token lives only in .telegram-config.
+  const isPlaceholder = (v) => !v || v.startsWith('YOUR_');
+  if (!isPlaceholder(envToken) && !isPlaceholder(envChat)) return { bot_token: envToken, chat_id: envChat };
   const cfgPath = path.join(WORKDIR, '.telegram-config');
   if (!fs.existsSync(cfgPath)) {
     throw new Error(`No Telegram config (env vars or ${cfgPath}).`);
