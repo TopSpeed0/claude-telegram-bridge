@@ -7,7 +7,8 @@
 // that is never committed: .git/leak-patterns.txt (shared by all worktrees),
 // or the file named by LEAK_PATTERNS_FILE. One JavaScript regex per line,
 // case-insensitive; blank lines and lines starting with # are ignored.
-// A line containing "leak-scan:allow" is skipped.
+// A line containing "leak-scan:allow" is skipped. In commit scans, a value
+// that HEAD marks that way is also accepted in older commits that lack the mark.
 //
 // Usage:
 //   node scripts/leak-scan.js              tracked files as they are on disk
@@ -55,12 +56,23 @@ const RULES = [...BUILT_IN, ...privateRules()];
 // Long secrets are shown masked; names are shown as found.
 const show = (rule, text) => (/token|key|header/.test(rule) && text.length > 12 ? `${text.slice(0, 6)}…${text.slice(-3)}` : text);
 
+// Values on "leak-scan:allow" lines in HEAD: known fakes (test secrets),
+// accepted in commit scans even where an older commit added them unmarked.
+function knownFakes() {
+  let lines = '';
+  try { lines = git('grep', '-h', '-I', '-F', 'leak-scan:allow', 'HEAD'); } catch { return new Set(); } // no match: exit 1
+  const fakes = new Set();
+  for (const line of lines.split('\n')) for (const [, re] of RULES) { const m = re.exec(line); if (m) fakes.add(m[0]); }
+  return fakes;
+}
+let fakes = new Set();
+
 const findings = [];
 function scanLine(where, line) {
   if (line.includes('leak-scan:allow')) return;
   for (const [rule, re] of RULES) {
     const m = re.exec(line);
-    if (m) findings.push(`${where}: ${rule}: ${show(rule, m[0])}`);
+    if (m && !fakes.has(m[0])) findings.push(`${where}: ${rule}: ${show(rule, m[0])}`);
   }
 }
 function scanText(where, text) {
@@ -70,6 +82,7 @@ function scanText(where, text) {
 
 // Author / committer, message and added lines of the given commits (git log arguments).
 function scanCommits(args) {
+  fakes = knownFakes();
   let commit = '', file = '', lineNo = 0, inMessage = false;
   const out = git('log', '-p', '--no-color', '--unified=0', '--format=@@commit %h%n@@who %an <%ae> / %cn <%ce>%n%B%n@@end', ...args);
   for (const line of out.split('\n')) {
