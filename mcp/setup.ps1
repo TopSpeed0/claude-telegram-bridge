@@ -155,15 +155,17 @@ $mcp = Read-JsonFile $mcpPath
 if (-not $mcp) { $mcp = Read-JsonFile (Join-Path $repo '.mcp.json.example') }
 if (-not $mcp.ContainsKey('mcpServers') -or -not $mcp.mcpServers) { $mcp.mcpServers = [ordered]@{} }
 $server = $mcp.mcpServers['telegram-tg']
-if (-not $server) { $server = [ordered]@{ command = 'node'; args = @('mcp/telegram-tg.js'); env = [ordered]@{} }; $mcp.mcpServers['telegram-tg'] = $server }
+if (-not $server) { $server = [ordered]@{ command = 'node'; args = @('mcp/telegram-tg.js') }; $mcp.mcpServers['telegram-tg'] = $server }
 $nodeArgs = @($server.args)
 if ($needSystemCa -and $nodeArgs -notcontains '--use-system-ca') { $nodeArgs = @('--use-system-ca') + $nodeArgs }
 $server.args = $nodeArgs
-if (-not $server.env) { $server.env = [ordered]@{} }
-$server.env.TELEGRAM_BOT_TOKEN = $token
-$server.env.TELEGRAM_CHAT_ID = $chatId
+# The token lives only in .telegram-config (telegram-tg reads it there); drop an older copy here.
+if ($server.env -is [System.Collections.IDictionary]) {
+  $server.env.Remove('TELEGRAM_BOT_TOKEN'); $server.env.Remove('TELEGRAM_CHAT_ID')
+  if ($server.env.Count -eq 0) { $server.Remove('env') }
+}
 Write-JsonFile $mcpPath $mcp
-Ok '.mcp.json: the telegram-tg server (tg_send, tg_ask) uses your bot; other servers in it are kept'
+Ok '.mcp.json: the telegram-tg server (tg_send, tg_ask) is listed; it reads your bot from .telegram-config. Other servers in it are kept'
 Copy-Example 'agent-runtime.json' 'agent-runtime.example.json'
 Copy-Example 'mcp-connectors.json' 'mcp-connectors.example.json'
 # The Hermes queue poller expects this file to exist.

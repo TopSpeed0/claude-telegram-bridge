@@ -21,7 +21,8 @@ A ready-to-clone workspace template for [Claude Code](https://claude.com/claude-
 | `mcp/install-shortcuts.ps1` | Windows Start Menu + Desktop shortcut creator |
 | `mcp/daemon-mcp.base.json` | Base MCP config for daemon-spawned sessions (placeholder env vars — real creds loaded from `.telegram-config`); the launcher builds `mcp/daemon-mcp.local.json` from it |
 | `CLAUDE.md` | Workspace instructions for Claude Code |
-| `.mcp.json.example` | Template — copy to `.mcp.json` and add your credentials |
+| `.mcp.json.example` | Template — copy to `.mcp.json`; lists the MCP servers, holds no secrets |
+| `mcp/.telegram-config.example` | Template — copy to `.telegram-config` in the repo root: your bot token and chat ID, the one place they live |
 | `.claude/settings.local.json` | Pre-configured permissions for PowerShell, Node, Telegram tools |
 | `.gitignore` | Excludes credentials and runtime state |
 
@@ -73,20 +74,20 @@ Manual alternative. Copy-paste this single block — it clones the repo, creates
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/TopSpeed0/claude-telegram-bridge.git; cd claude-telegram-bridge; Copy-Item .mcp.json.example .mcp.json; '{}' | Out-File -Encoding utf8 .claude-queue.json; Write-Host "`nEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude" -ForegroundColor Cyan
+git clone https://github.com/TopSpeed0/claude-telegram-bridge.git; cd claude-telegram-bridge; Copy-Item .mcp.json.example .mcp.json; Copy-Item mcp/.telegram-config.example .telegram-config; '{}' | Out-File -Encoding utf8 .claude-queue.json; Write-Host "`nEdit .telegram-config — paste your bot_token and chat_id, then run: claude" -ForegroundColor Cyan
 ```
 
 **macOS / Linux (bash, untested):**
 ```bash
-git clone https://github.com/TopSpeed0/claude-telegram-bridge.git && cd claude-telegram-bridge && cp .mcp.json.example .mcp.json && echo '{}' > .claude-queue.json && echo -e "\n\033[36mEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude\033[0m"
+git clone https://github.com/TopSpeed0/claude-telegram-bridge.git && cd claude-telegram-bridge && cp .mcp.json.example .mcp.json && cp mcp/.telegram-config.example .telegram-config && echo '{}' > .claude-queue.json && echo -e "\n\033[36mEdit .telegram-config — paste your bot_token and chat_id, then run: claude\033[0m"
 ```
 
-After editing `.mcp.json` with your credentials:
+After editing `.telegram-config` with your bot token and chat ID:
 ```bash
 claude
 ```
 
-That's it. Claude Code reads `.mcp.json`, auto-launches the Telegram MCP server, and you have `tg_send` + `tg_ask` tools ready.
+That's it. Claude Code reads `.mcp.json`, auto-launches the Telegram MCP server (it reads your bot from `.telegram-config`), and you have `tg_send` + `tg_ask` tools ready.
 
 > **Note:** `.claude-queue.json` is created empty (`{}`) by the install command above.
 > The Hermes queue poller (`hermesQueuePoll`) watches this file — it must exist before starting the daemon.

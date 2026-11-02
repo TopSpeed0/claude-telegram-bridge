@@ -44,11 +44,8 @@ Creates Windows Start Menu + Desktop shortcuts for one-click daemon launch.
 
 1. **Create a Telegram bot**: Talk to [@BotFather](https://t.me/BotFather), get your bot token
 2. **Get your chat ID**: Send a message to your bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` to find your `chat.id`
-3. **Configure credentials** (pick one):
-   - Copy `.mcp.json.example` to `.mcp.json` and fill in your token/chat_id
-   - Or create `.telegram-config` in the repo root (see `mcp/.telegram-config.example`)
-   - Or set env vars `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
-4. **Start Claude Code** in this workspace — the MCP server auto-starts via `.mcp.json`
+3. **Configure credentials**: put the token and chat ID in `.telegram-config` in the repo root (see `mcp/.telegram-config.example`) — the one place they live; the server, the daemon and the approval hook all read it. (`mcp/setup.ps1` does steps 1–4 for you. Env vars `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` also work, e.g. in CI.)
+4. **Start Claude Code** in this workspace — copy `.mcp.json.example` to `.mcp.json` (no secrets in it); the MCP server auto-starts from it
 5. **Optional — start the task daemon**:
    ```powershell
    .\mcp\start-task-daemon.ps1              # foreground
