@@ -60,3 +60,21 @@ test('a code block keeps its fence language as a Telegram label', () => {
   const long = Array.from({ length: 13 }, (_, i) => `line ${i}`).join('\n');
   assert.equal(preBlock(long, 'bash'), `<blockquote expandable><pre><code class="language-bash">${long}</code></pre></blockquote>`);
 });
+
+test('a progress line in Telegram HTML becomes Markdown for a rich draft', () => {
+  const { htmlLineToMarkdown } = require('../mcp/telegram-ui');
+  assert.equal(htmlLineToMarkdown('💻 <code>git status &amp;&amp; ls</code>'), '💻 `git status && ls`');
+  assert.equal(htmlLineToMarkdown('📖 Read <code>a&lt;b&gt;.md</code>'), '📖 Read `a<b>.md`');
+  assert.equal(htmlLineToMarkdown('💻 <code>echo `x`</code>'), '💻 `` echo `x` ``');
+  assert.equal(htmlLineToMarkdown('🤖 Agent: check &amp; report'), '🤖 Agent: check & report');
+});
+
+test('only long code blocks and long quotes keep an answer in HTML', () => {
+  const { collapsesOnlyInHtml } = require('../mcp/telegram-ui');
+  const lines = (n) => Array.from({ length: n }, (_, i) => `line ${i}`).join('\n');
+  assert.equal(collapsesOnlyInHtml(`ok\n\n\`\`\`bash\n${lines(12)}\n\`\`\``), false);
+  assert.equal(collapsesOnlyInHtml(`ok\n\n\`\`\`bash\n${lines(13)}\n\`\`\``), true);
+  assert.equal(collapsesOnlyInHtml('> a\n> b\n> c\n> d\nend'), false);
+  assert.equal(collapsesOnlyInHtml('> a\n> b\n> c\n> d\n> e'), true);
+  assert.equal(collapsesOnlyInHtml('| a | b |\n|---|---|\n| 1 | 2 |'), false);
+});

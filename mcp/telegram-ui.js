@@ -162,4 +162,26 @@ function richMarkdown(text) {
   return out + breaks(src.slice(pos));
 }
 
-module.exports = { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, choiceStyle, htmlPage, extractTables, richTables, preBlock, MONO_MAX_WIDTH, richMarkdown, RICH_LIMIT };
+// A progress line written as Telegram HTML (escaped text and <code> spans) as
+// Markdown, for a rich draft.
+function htmlLineToMarkdown(line) {
+  const unescape = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  return String(line).split(/(<code>[\s\S]*?<\/code>)/).map((part) => {
+    const code = /^<code>([\s\S]*)<\/code>$/.exec(part);
+    if (!code) return unescape(part);
+    const text = unescape(code[1]);
+    return text.includes('`') ? `\`\` ${text} \`\`` : `\`${text}\``;
+  }).join('');
+}
+
+// What only the HTML path does: a code block over 12 lines or a quote over 4
+// lines collapses into a tap-to-expand quote (preBlock, markdownToTelegramHTML).
+function collapsesOnlyInHtml(markdown) {
+  const src = String(markdown || '');
+  for (const m of src.matchAll(/```[^\n]*\n([\s\S]*?)```/g)) {
+    if (m[1].replace(/\n$/, '').split('\n').length > 12) return true;
+  }
+  return /^(?:>.*(?:\n|$)){5,}/m.test(src);
+}
+
+module.exports = { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, choiceStyle, htmlPage, extractTables, richTables, preBlock, MONO_MAX_WIDTH, richMarkdown, RICH_LIMIT, htmlLineToMarkdown, collapsesOnlyInHtml };

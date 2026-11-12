@@ -30,7 +30,7 @@ const { maskSecrets } = require('./secret-mask');
 const { noteMessage, sessionOfMessage } = require('./message-sessions');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
-const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage, extractTables, richTables, preBlock, richMarkdown, RICH_LIMIT } = require('./telegram-ui');
+const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage, extractTables, richTables, preBlock, richMarkdown, RICH_LIMIT, htmlLineToMarkdown, collapsesOnlyInHtml } = require('./telegram-ui');
 const { collectMcpServers, discoverMcpServers, callMcpTool, mcpMenuDescription } = require('./mcp-discovery');
 
 const WORKDIR = path.resolve(__dirname, '..');
@@ -358,9 +358,10 @@ function looksTabular(text) {
 // Tasks at least this long get 🎉 confetti on the answer the daemon relays.
 const EFFECT_CONFETTI = MESSAGE_EFFECTS.confetti;
 const CONFETTI_AFTER_MS = 2 * 60 * 1000;
-// Answers with a Markdown table are sent as rich messages (real tables); off with telegram.rich_tables: false.
-// Only narrow tables, though: one with more columns than this (data such as a
-// volume list) reads better as an aligned monospace block (telegram.rich_table_max_columns).
+// Answers are sent as rich messages (real tables, and the live draft goes away
+// at once); off with telegram.rich_tables: false. Only narrow tables stay
+// tables: one with more columns than this (data such as a volume list) reads
+// better as an aligned monospace block (telegram.rich_table_max_columns).
 const RICH_TABLES = TELEGRAM_RUNTIME.rich_tables !== false;
 const RICH_TABLE_MAX_COLUMNS = Number(TELEGRAM_RUNTIME.rich_table_max_columns) || 4;
 const hasTelegramTags = (text) => { TELEGRAM_TAG.lastIndex = 0; const found = TELEGRAM_TAG.test(text); TELEGRAM_TAG.lastIndex = 0; return found; };
@@ -382,14 +383,16 @@ async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, but
   let effectId = effect;
   const threadUnder = replyTo;
 
-  // An answer with a Markdown table goes out whole as a rich message
-  // (sendRichMessage): Telegram draws real tables, headings and lists from the
-  // Markdown itself, and tables wider than RICH_TABLE_MAX_COLUMNS become
-  // aligned code blocks in it (richTables). Text with Telegram HTML tags in
-  // it, text over the rich limit, or a refusal takes the usual HTML path
-  // below instead, where every table is a monospace block.
+  // A 'rich' answer goes out whole as a rich message (sendRichMessage):
+  // Telegram draws real tables, headings and lists from the Markdown itself,
+  // tables wider than RICH_TABLE_MAX_COLUMNS become aligned code blocks in it
+  // (richTables), and a rich answer is what removes the live draft at once.
+  // The HTML path below takes text with Telegram HTML tags, text over the rich
+  // limit, aligned CLI output, a code block or quote long enough to collapse
+  // (only HTML collapses them), or a refusal.
+  const prose = remaining.replace(/```[\s\S]*?```/g, '').replace(/^\s*\|.*$/gm, '');
   if (mode === 'rich' && RICH_TABLES && remaining.length <= RICH_LIMIT && !hasTelegramTags(remaining)
-      && extractTables(remaining, () => '').tables.length) {
+      && !looksTabular(prose) && !collapsesOnlyInHtml(remaining)) {
     try {
       const sent = await tgApi('sendRichMessage', {
         chat_id: config.chat_id,
@@ -418,8 +421,7 @@ async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, but
   // alignment matters more than formatting for CLI output. Fenced code and
   // Markdown table rows are already laid out, so only the prose is checked.
   let effectiveMode = mode;
-  const prose = remaining.replace(/```[\s\S]*?```/g, '').replace(/^\s*\|.*$/gm, '');
-  if (mode === 'rich' && looksTabular(prose)) effectiveMode = 'mono';
+  if (mode === 'rich' && looksTabular(remaining.replace(/```[\s\S]*?```/g, '').replace(/^\s*\|.*$/gm, ''))) effectiveMode = 'mono';
 
   while (remaining.length > 0) {
     let chunk = remaining.slice(0, MAX);
@@ -1294,8 +1296,8 @@ function startStatus(replyTo, { title = 'Working', workingReaction } = {}) {
 // (sendMessageDraft) instead of the status message: the time and steps, then
 // the text as Claude writes it (--include-partial-messages), with Telegram's
 // ⏹ Stop button. A draft is a 30-second preview, so it is refreshed while the
-// task runs; the final answer, sent as a normal message, replaces it, and
-// nothing of the stream stays in the chat. The streamed text is shown plain,
+// task runs; the final answer replaces it (at once when the answer is a rich
+// message, see sendDraft), and nothing of the stream stays in the chat. The streamed text is shown plain,
 // with Markdown symbols tidied away (previewText): formatting half-written
 // Markdown is what leaves raw tables and cut syntax behind; the final
 // answer is formatted once, complete. /progress sets how many steps show
@@ -1308,6 +1310,24 @@ const DRAFT_MAX_TEXT = 3000;      // the tail of a long text, inside the 4096 li
 const drafts = new Map(); // draft_id → what ⏹ Stop does for that task
 
 const useDraft = () => STREAM;
+
+// Drafts go out rich (sendRichMessageDraft): Telegram removes a rich draft the
+// moment a rich answer arrives, while a plain draft lingers several seconds
+// under any answer. Plain is the fallback: for one update when Telegram
+// refuses that text, for good if the method is not there.
+let richDrafts = true;
+async function sendDraft(draftId, { markdown, html, canStop = false }) {
+  const base = { chat_id: config.chat_id, draft_id: draftId, ...(canStop ? { can_stop: true } : {}) };
+  if (richDrafts) {
+    try {
+      return await tgApi('sendRichMessageDraft', { ...base, rich_message: { markdown: richMarkdown(markdown) } }, { lowPriority: true });
+    } catch (e) {
+      if (e.errorCode === 404) { richDrafts = false; log(`rich drafts unavailable (${e.message}) — using plain drafts`); }
+      else if (e.errorCode !== 400) throw e;
+    }
+  }
+  return tgApi('sendMessageDraft', { ...base, text: html, parse_mode: 'HTML' }, { lowPriority: true });
+}
 
 // Half-written Markdown made readable as plain text: no **, `, #, fences
 // or table rules; bullets as •, table rows as cells joined by ·.
@@ -1341,10 +1361,14 @@ function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}
     const secs = Math.floor((Date.now() - t0) / 1000);
     const shown = sentinelOnly(text) ? '' : text.replace(TG_SENT_SENTINEL, '');
     const writing = shown.trim() !== '';
-    const head = `${writing ? '✍️' : '⏳'} <b>${htmlEscape(writing ? 'Writing' : title)}</b> · ${secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`}`
-      + `${count ? ` · ${count} step${count === 1 ? '' : 's'}` : ''}`;
+    const icon = writing ? '✍️' : '⏳', label = writing ? 'Writing' : title;
+    const meta = `${secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`}${count ? ` · ${count} step${count === 1 ? '' : 's'}` : ''}`;
+    const shownSteps = mode.steps ? steps.slice(-mode.steps) : [];
     const body = previewText(shown.length > DRAFT_MAX_TEXT ? `…${shown.slice(-DRAFT_MAX_TEXT)}` : shown).trim();
-    return [head, ...(mode.steps ? steps.slice(-mode.steps) : []), body ? `\n${htmlEscape(body)} ▍` : ''].filter(Boolean).join('\n');
+    return {
+      markdown: [`${icon} **${label}** · ${meta}`, ...shownSteps.map(htmlLineToMarkdown), body ? `\n${body} ▍` : ''].filter(Boolean).join('\n'),
+      html: [`${icon} <b>${htmlEscape(label)}</b> · ${meta}`, ...shownSteps, body ? `\n${htmlEscape(body)} ▍` : ''].filter(Boolean).join('\n'),
+    };
   };
   const send = async () => {
     timer = null;
@@ -1352,7 +1376,7 @@ function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}
     if (quiet()) { heldBack++; return; }
     lastAt = Date.now();
     try {
-      await tgApi('sendMessageDraft', { chat_id: config.chat_id, draft_id: draftId, text: render(), parse_mode: 'HTML', can_stop: true }, { lowPriority: true });
+      await sendDraft(draftId, { ...render(), canStop: true });
       updates++;
     } catch (e) {
       failed = true; // typing and reactions still show the task is alive
@@ -1423,14 +1447,17 @@ function startVoiceProgress(replyTo) {
     const secs = Math.floor((Date.now() - t0) / 1000);
     const head = `${stage} · ${secs}s${duration ? ` · 🎙 ${clock(at)} / ${clock(duration)}` : ''}`;
     const text = heard.length > DRAFT_MAX_TEXT ? `…${heard.slice(-DRAFT_MAX_TEXT)}` : heard;
-    return `<b>${htmlEscape(head)}</b>${text ? `\n\n<i>${htmlEscape(text)}</i> ▍` : ''}`;
+    return {
+      markdown: `**${head}**${text ? `\n\n_${text}_ ▍` : ''}`,
+      html: `<b>${htmlEscape(head)}</b>${text ? `\n\n<i>${htmlEscape(text)}</i> ▍` : ''}`,
+    };
   };
   const send = async () => {
     timer = null;
     if (stopped || failed) return;
     lastAt = Date.now();
     try {
-      await tgApi('sendMessageDraft', { chat_id: config.chat_id, draft_id: draftId, text: render(), parse_mode: 'HTML' }, { lowPriority: true });
+      await sendDraft(draftId, render());
       updates++;
     } catch (e) {
       failed = true;
