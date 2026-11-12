@@ -238,11 +238,15 @@ function recoverReplyFromTranscript(sessionId) {
 const telegram = createTelegramClient({ token: config.bot_token, log });
 // When the bot last put a real message in the chat: a live draft must not be
 // refreshed after that, or it shows up again under the answer (see startDraft).
+// Set as soon as the message is queued, not only once Telegram confirms it:
+// a refresh due in between would go out after the answer and linger there.
 let botSpokeAt = 0;
 const SPEAKS = /^(sendMessage|sendRichMessage|sendDocument|sendPhoto|sendVoice|sendAudio|sendVideo|sendMediaGroup)$/;
 function tgApi(method, params, options) {
+  const speaks = SPEAKS.test(method);
+  if (speaks) botSpokeAt = Date.now();
   const call = telegram.call(method, params, options);
-  if (SPEAKS.test(method)) call.then(() => { botSpokeAt = Date.now(); }, () => {});
+  if (speaks) call.then(() => { botSpokeAt = Date.now(); }, () => {});
   return call;
 }
 
@@ -1324,7 +1328,7 @@ function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}
   const t0 = Date.now();
   const mode = PROGRESS_MODES[progressMode()];
   const steps = [];
-  let count = 0, text = '', stopped = false, failed = false, lastAt = 0, timer = null, updates = 0, streamed = 0;
+  let count = 0, text = '', stopped = false, failed = false, lastAt = 0, timer = null, updates = 0, streamed = 0, heldBack = 0;
   // A real message from the bot replaces the draft, and the API has no way to
   // clear one: a refresh after it would bring the bubble back under the
   // answer, where nothing removes it. So once the bot has spoken (or Claude
@@ -1344,7 +1348,8 @@ function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}
   };
   const send = async () => {
     timer = null;
-    if (stopped || failed || quiet()) return;
+    if (stopped || failed) return;
+    if (quiet()) { heldBack++; return; }
     lastAt = Date.now();
     try {
       await tgApi('sendMessageDraft', { chat_id: config.chat_id, draft_id: draftId, text: render(), parse_mode: 'HTML', can_stop: true }, { lowPriority: true });
@@ -1398,7 +1403,8 @@ function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}
       clearInterval(keepalive);
       clearTimeout(timer);
       drafts.delete(draftId);
-      log(`draft: ${updates} update(s), ${streamed} chars streamed, ${count} step(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s${failed ? ' (stopped after an error)' : ''}`);
+      log(`draft: ${updates} update(s), ${streamed} chars streamed, ${count} step(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s`
+        + `${heldBack ? `, ${heldBack} held back after the bot spoke` : ''}${failed ? ' (stopped after an error)' : ''}`);
     },
   };
 }
