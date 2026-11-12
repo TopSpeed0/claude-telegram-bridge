@@ -2646,10 +2646,16 @@ function setRunningStatus(msgId, statusMessageId) {
 function clearRunning(msgId) {
   if (state.running && state.running[msgId]) { delete state.running[msgId]; saveState(); }
 }
+// The tasks the restart cut off: those marked running when this process
+// started, taken before polling begins. A message that waited during the
+// outage may already be running when recovery gets its turn; it is not one.
+const interruptedAtStart = Object.entries(state.running || {});
 async function recoverInterrupted() {
-  const entries = Object.entries(state.running || {});
+  const entries = interruptedAtStart;
   if (!entries.length) return;
-  state.running = {};
+  for (const [msgId, task] of entries) {
+    if (state.running && state.running[msgId] && state.running[msgId].startedAt === task.startedAt) delete state.running[msgId];
+  }
   saveState();
   for (const [msgId, task] of entries) {
     const id = Number(msgId);
@@ -3727,7 +3733,7 @@ async function motdText(prevStop) {
   const now = Date.now();
   const started = DAEMON_STARTED_AT.getTime();
   // A main task still marked running was cut off by this restart; it is the real last job.
-  const cut = Object.values(state.running || {}).find(t => t.kind === 'main');
+  const cut = interruptedAtStart.map(([, task]) => task).find(t => t.kind === 'main');
   const job = cut ? { status: 'interrupted', at: cut.startedAt } : state.lastJob;
   const jobText = job
     ? `${{ success: '✅ Success', failed: '❌ Failed', stopped: '⏹ Stopped', interrupted: '⚠️ Interrupted' }[job.status] || job.status} ${tgTime(job.at, 'r', 'earlier')}`
