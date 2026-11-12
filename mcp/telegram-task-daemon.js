@@ -32,6 +32,7 @@ const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
 const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage, extractTables, richTables, preBlock, richMarkdown, RICH_LIMIT, htmlLineToMarkdown, collapsesOnlyInHtml } = require('./telegram-ui');
 const { collectMcpServers, discoverMcpServers, callMcpTool, mcpMenuDescription } = require('./mcp-discovery');
+const claudeSessions = require('./claude-sessions');
 
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
@@ -40,7 +41,8 @@ const EMPTY_MCP = path.join(__dirname, 'daemon-mcp.local.json');
 // Tells every spawned session it runs under the daemon, so it follows the
 // daemon rules in CLAUDE.md (an interactive session never gets this line).
 const DAEMON_NOTE = 'You are running under the Telegram task daemon: the user reads your replies in Telegram. '
-  + 'Follow the "Telegram Behavioral Rules" in CLAUDE.md for daemon sessions.';
+  + 'Follow the "Telegram Behavioral Rules" in CLAUDE.md for daemon sessions. '
+  + 'A message from another Claude session that arrives between Telegram tasks is shown to the user as it is: do not repeat it, reply only with what you add.';
 
 // ---------- Conversation archive / memory ----------
 // Continuity lives in OUR files, not Claude's fragile session resume. Every turn
@@ -108,7 +110,8 @@ const config = loadConfig();
 // id is the owner's user id; in a group chat (negative id) any member can.
 const fromOwner = (user) => Number(config.chat_id) < 0 || String(user && user.id) === String(config.chat_id);
 
-let state = { updateOffset: 0, sessionId: null, day: null, summary: '', lastActivity: null, queue: [], lastTask: null, usage: null };
+// main: another session loaded into the main chat with /sessions ({ cwd, mode, name, from }), null for the bot's own.
+let state = { updateOffset: 0, sessionId: null, day: null, summary: '', lastActivity: null, queue: [], lastTask: null, usage: null, main: null };
 let sessionExpiredAtStart = false; // for the startup banner
 try {
   const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
@@ -122,6 +125,7 @@ try {
     if (idle > SESSION_TTL_MS) {
       log(`session ${state.sessionId} expired after ${Math.round(idle/60000)}m idle — starting fresh`);
       state.sessionId = null;
+      state.main = null;
       sessionExpiredAtStart = true;
     }
   }
@@ -173,6 +177,15 @@ const PROJECT_DIR = (() => {
   return candidates.find(p => fs.existsSync(p)) || candidates[0];
 })();
 
+// A loaded session lives in another folder, so its transcript is elsewhere too.
+function transcriptFile(sessionId) {
+  const own = path.join(PROJECT_DIR, `${sessionId}.jsonl`);
+  if (fs.existsSync(own)) return own;
+  return claudeSessions.findTranscript(sessionId, state.main && state.main.cwd) || own;
+}
+const mainCwd = () => (state.main && state.main.cwd) || WORKDIR;
+const mainMode = () => (state.main && state.main.mode) || undefined;
+
 // ---------- Archive helpers ----------
 function localDayKey(d) {
   d = d || new Date();
@@ -213,7 +226,7 @@ function saveDailySummaries(obj) {
 function recoverReplyFromTranscript(sessionId) {
   if (!sessionId) return null;
   let lines;
-  try { lines = fs.readFileSync(path.join(PROJECT_DIR, `${sessionId}.jsonl`), 'utf-8').split('\n').filter(Boolean); }
+  try { lines = fs.readFileSync(transcriptFile(sessionId), 'utf-8').split('\n').filter(Boolean); }
   catch { return null; }
   // Track the last meaningful reply in document order. A tg_send tool-call carries
   // the real text; the trailing "[sent-via-tg]" sentinel text block is ignored.
@@ -576,6 +589,12 @@ function killTree(proc) {
 
 // Task-session Claude processes, so /stop can end them. Summaries are not tracked.
 let activeTask = null;      // the main conversation (and Hermes queue tasks): { proc, stopped }
+const childPids = new Set(); // every Claude this daemon runs, kept out of /sessions
+function trackChild(proc) {
+  if (!proc.pid) return;
+  childPids.add(proc.pid);
+  proc.once('close', () => childPids.delete(proc.pid));
+}
 const bgTasks = new Map();  // /bg side tasks by Telegram message id: { proc, stopped, text, startedAt }
 function stopHandle(handle, why) {
   handle.stopped = true;
@@ -617,7 +636,8 @@ function writeDaemonSettings() {
 //                    shows) on top of the daemon's own connectors. Summaries
 //                    pass false: they need no tools, and connecting to every
 //                    server would only slow them down.
-function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, replyTo, permissionMode, onEvent, nativeMcp = true } = {}) {
+//   cwd              the folder Claude runs in: a session loaded with /sessions runs in its own.
+function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, replyTo, permissionMode, onEvent, nativeMcp = true, cwd = WORKDIR } = {}) {
   return new Promise((resolve) => {
     const oversized = task.length > MAX_PROMPT_ARG_CHARS;
     const promptArg = oversized
@@ -643,7 +663,8 @@ function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, rep
     delete env.TELEGRAM_REPLY_TO_MESSAGE_ID;
     if (replyTo != null) env.TELEGRAM_REPLY_TO_MESSAGE_ID = String(replyTo);
     const proc = spawn(CLAUDE_EXECUTABLE, args,
-      { cwd: WORKDIR, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    trackChild(proc);
     const handle = { proc, stopped: false };
     if (onSpawn) onSpawn(handle);
     let out = '', errOut = '', killed = false;
@@ -750,22 +771,34 @@ function formatUsage() {
 // run on the same conversation, /stop, or 30 idle minutes. Side tasks, the
 // Hermes queue and summaries still start their own process. Turn off with
 // telegram.warm: false in agent-runtime.json.
+//
+// The warm Claude can also start a turn on its own, between tasks: a message
+// from another Claude session (a reply to ✉️ Send message in /sessions), an
+// idle notice, a finished background task. That turn is "loose": its answer
+// goes to the chat (postLooseTurn) and the next task waits until it is over.
 const WARM_ENABLED = TELEGRAM_RUNTIME.warm !== false;
 const WARM_IDLE_MS = 30 * 60 * 1000;
-let warm = null; // { proc, sessionId, model, buf, turn, lastCost, errOut, used, idleTimer }
+let warm = null; // { proc, sessionId, model, cwd, mode, buf, turn, loose, lastResultAt, lastCost, errOut, used, idleTimer }
 
-function startWarm(sessionId, resuming, model) {
+// The last message sent with ✉️ Send message: { sessionId, name, socket, cwd, sentAt, replied }.
+// The warm Claude stays open (up to RELAY_WAIT_MS) so the reply can reach it.
+let relay = null;
+const RELAY_WAIT_MS = 2 * 60 * 60 * 1000;
+
+function startWarm(sessionId, resuming, model, { cwd = WORKDIR, mode } = {}) {
   const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', ...(STREAM ? ['--include-partial-messages'] : []),
-    '--model', String(model), '--mcp-config', EMPTY_MCP, '--settings', DAEMON_SETTINGS, '--append-system-prompt', DAEMON_NOTE, '--dangerously-skip-permissions'];
+    '--model', String(model), '--mcp-config', EMPTY_MCP, '--settings', DAEMON_SETTINGS, '--append-system-prompt', DAEMON_NOTE,
+    ...(mode ? ['--permission-mode', mode] : ['--dangerously-skip-permissions'])];
   if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
   if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
   if (CLAUDE_RUNTIME.chrome === true) args.push('--chrome');
   args.push(...(resuming ? ['--resume', sessionId] : ['--session-id', sessionId]));
-  log(`warm: starting Claude (${resuming ? 'resume' : 'new'} session ${sessionId}, model ${model})`);
+  log(`warm: starting Claude (${resuming ? 'resume' : 'new'} session ${sessionId}, model ${model}${mode ? `, mode ${mode}` : ''}${cwd !== WORKDIR ? `, in ${cwd}` : ''})`);
   const env = { ...process.env, TELEGRAM_UNDER_DAEMON: '1' };
   delete env.TELEGRAM_REPLY_TO_MESSAGE_ID; // per message: see handshake.setCurrentTask
-  const proc = spawn(CLAUDE_EXECUTABLE, args, { cwd: WORKDIR, env, stdio: ['pipe', 'pipe', 'pipe'] });
-  const w = { proc, sessionId, model: String(model), buf: '', turn: null, lastCost: 0, errOut: '', used: false, idleTimer: null };
+  const proc = spawn(CLAUDE_EXECUTABLE, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  trackChild(proc);
+  const w = { proc, sessionId, model: String(model), cwd, mode, buf: '', turn: null, loose: null, lastResultAt: Date.now(), lastCost: 0, errOut: '', used: false, idleTimer: null };
   const finishTurn = (result) => {
     const turn = w.turn;
     if (!turn) return;
@@ -787,10 +820,27 @@ function startWarm(sessionId, resuming, model) {
         const cost = Number(ev.total_cost_usd) || 0;
         const envelope = { ...ev, total_cost_usd: Math.max(0, cost - w.lastCost) };
         w.lastCost = cost;
-        finishTurn({ code: ev.is_error ? 1 : 0, out: JSON.stringify(envelope) });
+        if (w.turn) finishTurn({ code: ev.is_error ? 1 : 0, out: JSON.stringify(envelope) });
+        else looseTurnDone(w, envelope);
+        w.lastResultAt = Date.now();
         armWarmIdle(w);
-      } else if (w.turn && w.turn.onEvent) {
-        try { w.turn.onEvent(ev); } catch (e) { log(`progress: ${e.message}`); }
+      } else if (w.turn) {
+        if (w.turn.onEvent) { try { w.turn.onEvent(ev); } catch (e) { log(`progress: ${e.message}`); } }
+      } else if (ev.type === 'command_lifecycle') {
+        // Bookkeeping around a queued prompt; one also follows the result, so it starts nothing.
+        log(`warm: ${JSON.stringify(ev).slice(0, 200)}`);
+      } else if (!w.loose && (ev.type === 'assistant' || ev.type === 'stream_event' || ev.type === 'user')) {
+        const loose = { since: w.lastResultAt, waiters: [] };
+        // A turn that never reports its end must not hold the next task forever.
+        loose.timer = setTimeout(() => {
+          if (w.loose !== loose) return;
+          log('warm: its own turn sent no result in 15 min; tasks go on');
+          w.loose = null;
+          for (const release of loose.waiters) release();
+        }, 15 * 60 * 1000);
+        w.loose = loose;
+        clearTimeout(w.idleTimer);
+        log(`warm: Claude started a turn on its own (between tasks, first event: ${ev.type})`);
       }
     }
   });
@@ -802,13 +852,60 @@ function startWarm(sessionId, resuming, model) {
     clearTimeout(w.idleTimer);
     log(`warm: Claude exited (code ${code})`);
     finishTurn({ code: code == null ? -1 : code, out: '' });
+    if (w.loose) { clearTimeout(w.loose.timer); for (const release of w.loose.waiters) release(); w.loose = null; }
   });
   return w;
 }
 
+function looseTurnDone(w, envelope) {
+  const loose = w.loose || { since: w.lastResultAt, waiters: [] };
+  w.loose = null;
+  clearTimeout(loose.timer);
+  for (const release of loose.waiters) release();
+  recordUsage(envelope, w.model, 'between tasks');
+  postLooseTurn(w, envelope, loose.since).catch(e => log(`turn between tasks: ${e.message}`));
+}
+
+const waitLoose = (w) => new Promise(resolve => (w.loose ? w.loose.waiters.push(resolve) : resolve()));
+
+// What the warm Claude did on its own goes to the chat: a message from another
+// session word for word, then whatever Claude added. An idle notice alone stays
+// quiet, unless it ends a ✉️ Send message that got no reply: then the other
+// session's last answer is read from its transcript.
+async function postLooseTurn(w, envelope, since) {
+  const file = claudeSessions.findTranscript(w.sessionId, w.cwd);
+  const records = file ? claudeSessions.since(claudeSessions.readTail(file), since - 1000) : [];
+  const { peers, idle, others } = claudeSessions.turnInputs(records);
+  const said = stripAnsi(String(envelope.result || '')).trim();
+  const own = said && !TG_SENT_SENTINEL.test(said) ? said : '';
+  log(`warm: turn between tasks: ${peers.length} message(s) from other sessions, ${idle.length} idle notice(s), ${others} other; reply ${own.length} chars`);
+  const parts = [];
+  const onlyRelayNotice = !peers.length && !others && idle.length > 0 && !!relay && idle.every(name => name === relay.name);
+  for (const peer of peers) {
+    const isReply = !!relay && (peer.from === `uds:${relay.socket}` || peer.name === relay.name);
+    if (isReply) relay.replied = true;
+    parts.push(`💬 **${peer.name}** ${isReply ? 'replied' : 'wrote'}:\n\n${peer.body}`);
+  }
+  if (relay && idle.includes(relay.name)) {
+    if (!relay.replied) {
+      const target = claudeSessions.findTranscript(relay.sessionId, relay.cwd);
+      const answer = target ? claudeSessions.lastAssistantText(claudeSessions.since(claudeSessions.readTail(target), relay.sentAt)) : null;
+      parts.push(answer ? `💬 **${relay.name}** finished without replying. Its last answer:\n\n${answer}` : `💬 **${relay.name}** finished without replying.`);
+    }
+    relay = null;
+  }
+  if (own && !onlyRelayNotice) parts.push(peers.length ? `🤖 ${own}` : own);
+  if (!parts.length) return;
+  await sendChunked(parts.join('\n\n'), { mode: 'rich', session: w.sessionId });
+}
+
 function armWarmIdle(w) {
   clearTimeout(w.idleTimer);
-  w.idleTimer = setTimeout(() => { if (warm === w && !w.turn) closeWarm('idle for 30 min'); }, WARM_IDLE_MS);
+  w.idleTimer = setTimeout(() => {
+    if (warm !== w || w.turn || w.loose) return;
+    if (relay && Date.now() - relay.sentAt < RELAY_WAIT_MS) { armWarmIdle(w); return; }
+    closeWarm('idle for 30 min');
+  }, WARM_IDLE_MS);
 }
 
 function closeWarm(reason) {
@@ -817,6 +914,7 @@ function closeWarm(reason) {
   warm = null;
   clearTimeout(w.idleTimer);
   log(`warm: closing Claude (${reason})`);
+  if (relay) { log(`relay: a reply from ${relay.name} can no longer arrive`); relay = null; }
   try { w.proc.stdin.end(); } catch (_) {}
   setTimeout(() => { if (w.proc.exitCode == null) killTree(w.proc); }, 5000);
 }
@@ -824,16 +922,18 @@ function closeWarm(reason) {
 // Starts Claude ahead of the first message, so even that one is quick.
 function prewarm() {
   if (!WARM_ENABLED || warm) return;
-  if (state.sessionId) warm = startWarm(state.sessionId, true, CLAUDE_RUNTIME.model);
-  else warm = startWarm(crypto.randomUUID(), false, CLAUDE_RUNTIME.model);
+  const where = { cwd: mainCwd(), mode: mainMode() };
+  if (state.sessionId) warm = startWarm(state.sessionId, true, CLAUDE_RUNTIME.model, where);
+  else warm = startWarm(crypto.randomUUID(), false, CLAUDE_RUNTIME.model, where);
   armWarmIdle(warm);
 }
 
 // One message to the warm Claude; resolves like claudeRaw.
-function warmTurn(prompt, { sessionId, resuming, model, onEvent, onSpawn, replyTo }) {
+async function warmTurn(prompt, { sessionId, resuming, model, cwd = WORKDIR, mode, onEvent, onSpawn, replyTo }) {
+  if (warm && warm.loose) { log('warm: waiting for the turn it started on its own'); await waitLoose(warm); }
   return new Promise((resolve) => {
-    if (warm && (warm.model !== String(model) || warm.sessionId !== sessionId || warm.turn)) closeWarm('different session or model');
-    if (!warm) warm = startWarm(sessionId, resuming, model);
+    if (warm && (warm.model !== String(model) || warm.sessionId !== sessionId || warm.cwd !== cwd || warm.mode !== mode || warm.turn)) closeWarm('different session, folder, mode or model');
+    if (!warm) warm = startWarm(sessionId, resuming, model, { cwd, mode });
     const w = warm;
     clearTimeout(w.idleTimer);
     w.used = true;
@@ -870,6 +970,7 @@ const ROTATE_TOKENS = Number(TELEGRAM_RUNTIME.rotate_tokens) || 150000;
 function startFreshConversation(reason) {
   closeWarm(reason);
   state.sessionId = null;
+  state.main = null;
   state.lastActivity = null;
   state.planNonce = null; // a plan is only executable in the conversation that made it
   saveState();
@@ -992,6 +1093,9 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
   if (forkFrom) isolated = true;
   const resuming = !isolated && !!state.sessionId;
   const useWarm = WARM_ENABLED && !isolated && !permissionMode;
+  // A session loaded with /sessions runs in its own folder, read-only until 🔓 Full mode.
+  const cwd = isolated ? WORKDIR : mainCwd();
+  const mode = permissionMode || (isolated ? undefined : mainMode());
   // Own the session id ourselves: reuse the pinned one, or mint a UUID for a
   // fresh session (or take the one a pre-started warm Claude already has).
   const sessionId = isolated ? crypto.randomUUID()
@@ -1007,8 +1111,8 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
   // A separate process on the same conversation must not run beside the warm one.
   if (!isolated && !useWarm) closeWarm('a separate run on the main conversation');
   const { code, out, errOut, killed, stopped } = useWarm
-    ? await warmTurn(prompt, { sessionId, resuming, model, onEvent, onSpawn: register, replyTo })
-    : await claudeRaw(prompt, sessionArgs, { model, onSpawn: register, replyTo, permissionMode, onEvent });
+    ? await warmTurn(prompt, { sessionId, resuming, model, cwd, mode, onEvent, onSpawn: register, replyTo })
+    : await claudeRaw(prompt, sessionArgs, { model, onSpawn: register, replyTo, permissionMode: mode, onEvent, cwd });
   if (mainHandle && activeTask === mainHandle) activeTask = null;
   if (stopped) return { ok: false, text: '__STOPPED__', code: -1 };
   if (killed) {
@@ -1029,7 +1133,7 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
   const RESUME_FAILED = /no conversation found|session (id )?.*(not found|invalid|expired)|could not (resume|find session)|unable to resume/i;
   if (code !== 0 && resuming && RESUME_FAILED.test(errOut)) {
     log(`session ${sessionId} rejected — resetting to fresh`);
-    state.sessionId = null; saveState();
+    state.sessionId = null; state.main = null; saveState();
     return { ok: false, text: '__SESSION_EXPIRED__' };
   }
 
@@ -1927,6 +2031,7 @@ function persistModelSelection(requested) {
   closeWarm('model changed');
   RUNTIME.agents.claude.model = model;
   state.sessionId = null;
+  state.main = null;
   state.lastActivity = null;
   saveState();
   return model;
@@ -1956,7 +2061,7 @@ async function telegramCommand(rawText) {
     mcpNames: mcpNames(),
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
-        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/approvals — latest approval decisions and your Always rules · <code>/approvals revoke &lt;n&gt;</code>\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — a look-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating look-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n/sentry — watch monitoring alerts (on · off · now); new ones come with 🔎 Investigate · <code>/sentry ignore &lt;text&gt;</code> · <code>/sentry ignored</code>\n\n'
+        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/approvals — latest approval decisions and your Always rules · <code>/approvals revoke &lt;n&gt;</code>\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — a look-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating look-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n/sentry — watch monitoring alerts (on · off · now); new ones come with 🔎 Investigate · <code>/sentry ignore &lt;text&gt;</code> · <code>/sentry ignored</code>\n/sessions — your other live Claude sessions: 📥 load one here (a read-only copy at first) or ✉️ send it a message; its reply comes back here\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/search &lt;words&gt; — find past conversations in the archive; 🧠 Summarize for what was done\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '↩️ Reply to an older answer (or a side task\'s) to continue in that conversation; 📌 makes it the main chat.\n'
@@ -1970,11 +2075,13 @@ async function telegramCommand(rawText) {
       remind: (argument) => scheduleCommand('remind', argument),
       every: (argument) => scheduleCommand('every', argument),
       search: (argument) => searchView(argument).text,
+      sessions: () => sessionsView().text,
       sentry: () => sentryView().text,
       approvals: (argument) => approvalsCommand(argument),
       status: () => {
         const readiness = mcp();
-        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code> · Scheduled: <code>${schedules().length}</code>\nSentry: <code>${SENTRY_SOURCES.length ? (sentryActive() ? `active, ${SENTRY_SOURCES.length} source(s)` : 'disabled') : 'not set up'}</code> (/sentry)\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
+        const loaded = state.main ? `\nLoaded: <b>${htmlEscape(state.main.name)}</b> (${state.main.mode === 'plan' ? 'read-only' : 'full mode'}) in <code>${htmlEscape(state.main.cwd)}</code>` : '';
+        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>${loaded}\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code> · Scheduled: <code>${schedules().length}</code>\nSentry: <code>${SENTRY_SOURCES.length ? (sentryActive() ? `active, ${SENTRY_SOURCES.length} source(s)` : 'disabled') : 'not set up'}</code> (/sentry)\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
       },
       model: (argument) => {
         if (!argument) return `<b>Configured model</b>: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\n<b>Allowed models</b>\n<code>${configuredModels().map(htmlEscape).join('\n')}</code>\n\nUse <code>/model &lt;name&gt;</code> to switch. This starts the next task with a fresh Claude session.`;
@@ -2023,6 +2130,7 @@ async function telegramCommand(rawText) {
       clear: () => {
         closeWarm('/new');
         state.sessionId = null;
+        state.main = null;
         state.lastActivity = null;
         state.planNonce = null;
         state.contextResetAt = new Date().toISOString();
@@ -2098,6 +2206,8 @@ function planButton(cq) {
 // A queue item is { text, msgId, media?, ts }. Commands are recognised from text.
 async function handleMessage(item) {
   const msgId = item.msgId;
+  if (item.load) return loadSession(item.load, msgId);
+  if (item.relayTo) return relayMessage(item.relayTo, item.text, msgId);
   let rawText = item.text || '';
   let permissionMode;
   const parsed = item.media ? null : parseTelegramCommand(rawText);
@@ -2194,7 +2304,8 @@ async function runTask(rawText, msgId, t0, { permissionMode, status } = {}) {
 
   // Silent fork (idle / reboot): the first reply was context-less. Restore our
   // history from the archive and re-run so the answer is informed.
-  if (ok && forked) {
+  // The archive is the bot's own chat: it does not belong in a session loaded from elsewhere.
+  if (ok && forked && !state.main) {
     const ctx = await buildRestoreContext();
     if (ctx) {
       log('fork detected — re-running with restored context');
@@ -2317,6 +2428,7 @@ function resumeButton(cq) {
   if (busy) { answer('A task is running; tap again when it is done.'); return true; }
   closeWarm('switching the main chat');
   state.sessionId = id;
+  state.main = null;
   state.lastActivity = new Date().toISOString();
   state.planNonce = null;
   saveState();
@@ -2325,6 +2437,198 @@ function resumeButton(cq) {
   tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }, { lowPriority: true })
     .catch(e => log(`resume button: ${e.message}`));
   return true;
+}
+
+// ---------- /sessions: the user's other Claude sessions ----------
+// The live Claude Code sessions on this PC (Desktop app and terminal, the list
+// ListAgents gives), read from Claude Code's own files without a Claude run.
+// Tap one for:
+//   📥 Load here: the main chat continues a copy of it (--fork-session) in its
+//      own folder, read-only until 🔓 Full mode. A session no longer running
+//      is continued as it is. /new goes back to the bot's own chat.
+//   ✉️ Send message: the next text goes to it through the warm Claude's
+//      SendMessage; its reply arrives as a turn of its own (postLooseTurn).
+const sessionMenus = new Map(); // nonce -> { at, list }
+const SESSION_MENU_TTL_MS = 30 * 60 * 1000;
+const RELAY_DRAFT_TTL_MS = 10 * 60 * 1000;
+let relayDraft = null; // ✉️ tapped: { sessionId, name, socket, cwd, at }
+
+function liveSessions() {
+  const own = new Set([state.sessionId, warm && warm.sessionId].filter(Boolean));
+  return claudeSessions.listLiveSessions({ exclude: (s) => own.has(s.sessionId) || childPids.has(s.pid) });
+}
+
+const sessionIcon = (s) => (s.status === 'busy' ? '⏳' : s.status === 'idle' ? '🟢' : '⚪');
+const sessionTarget = (s) => ({ sessionId: s.sessionId, name: s.name, socket: s.socket, cwd: s.cwd });
+
+function sessionsView(nonce) {
+  const list = liveSessions();
+  const key = nonce || crypto.randomBytes(4).toString('hex');
+  for (const [k, menu] of sessionMenus) if (Date.now() - menu.at > SESSION_MENU_TTL_MS) sessionMenus.delete(k);
+  sessionMenus.set(key, { at: Date.now(), list });
+  const loaded = state.main ? `\n\n📥 Loaded here now: <b>${htmlEscape(state.main.name)}</b>${state.main.mode === 'plan' ? ' (read-only)' : ''}. /new goes back to the bot's own chat.` : '';
+  if (!list.length) return { text: `🖥 <b>No other Claude sessions are running.</b>${loaded}` };
+  const shown = list.slice(0, 20);
+  return {
+    text: `🖥 <b>Live Claude sessions (${list.length})</b>\nTap one to load it here or to send it a message.${list.length > shown.length ? ` The ${shown.length} most recently active are shown.` : ''}${loaded}`,
+    buttons: shown.map((s, i) => [{ text: `${sessionIcon(s)} ${shorten(s.name, 48)}`, callback_data: `ss:pick:${key}:${i}` }]),
+  };
+}
+
+function sessionDetail(s, key, index) {
+  const active = s.updatedAt ? ` · active ${tgTime(s.updatedAt, 'r', shortTime(s.updatedAt, true))}` : '';
+  return {
+    text: `${sessionIcon(s)} <b>${htmlEscape(s.name)}</b>\n📁 <code>${htmlEscape(s.cwd || '?')}</code>\n${s.desktop ? '🖥 Desktop app' : '⌨️ Terminal'} · ${htmlEscape(s.status)}${active}\n\n`
+      + '📥 <b>Load here</b>: continue a copy of it in this chat, read-only until you allow changes. The session itself is not touched.\n'
+      + '✉️ <b>Send message</b>: your next message goes to it, and its reply comes back here.',
+    buttons: [
+      [{ text: '📥 Load here', callback_data: `ss:load:${key}:${index}` }, { text: '✉️ Send message', callback_data: `ss:send:${key}:${index}` }],
+      [{ text: '⬅️ Back', callback_data: `ss:back:${key}` }],
+    ],
+  };
+}
+
+function editSessionsMessage(messageId, view) {
+  return tgApi('editMessageText', {
+    chat_id: config.chat_id, message_id: messageId, parse_mode: 'HTML', text: view.text,
+    reply_markup: { inline_keyboard: view.buttons || [] },
+  }).catch(e => { if (!/not modified/i.test(e.message)) log(`sessions: ${e.message}`); });
+}
+
+// Returns false when the button was not ours.
+function sessionsButton(cq) {
+  const [tag, action, key, index] = String(cq.data || '').split(':');
+  if (tag !== 'ss') return false;
+  if (!cq.message || String(cq.message.chat.id) !== String(config.chat_id)) return true;
+  const messageId = cq.message.message_id;
+  const answer = (text) => tgApi('answerCallbackQuery', { callback_query_id: cq.id, ...(text ? { text } : {}) }).catch(() => {});
+  if (action === 'full') { fullModeButton(key, messageId, answer); return true; }
+  if (action === 'cancel') {
+    relayDraft = null;
+    answer('Cancelled');
+    editSessionsMessage(messageId, { text: '✉️ Cancelled: nothing was sent.' });
+    return true;
+  }
+  const menu = sessionMenus.get(key);
+  if (!menu) { handleStaleButton(cq); return true; }
+  if (action === 'back') { answer(); editSessionsMessage(messageId, sessionsView(key)); return true; }
+  const picked = menu.list[Number(index)];
+  const live = picked && liveSessions().find(s => s.sessionId === picked.sessionId);
+  if (!live) {
+    answer('⌛ That session has ended.');
+    editSessionsMessage(messageId, sessionsView(key));
+    return true;
+  }
+  if (action === 'pick') { answer(); editSessionsMessage(messageId, sessionDetail(live, key, index)); return true; }
+  if (action === 'load') {
+    answer('📥 Loading…');
+    editSessionsMessage(messageId, { text: `📥 Loading <b>${htmlEscape(live.name)}</b> into this chat…` });
+    enqueue({ text: `📥 Load ${live.name}`, msgId: messageId, load: sessionTarget(live) });
+    return true;
+  }
+  if (action === 'send') {
+    if (!WARM_ENABLED) { answer('This needs the warm Claude (telegram.warm in agent-runtime.json).'); return true; }
+    if (!live.socket) { answer('That session cannot receive messages.'); return true; }
+    relayDraft = { ...sessionTarget(live), at: Date.now() };
+    answer('✉️ Type your message');
+    editSessionsMessage(messageId, {
+      text: `✉️ Your next message goes to <b>${htmlEscape(live.name)}</b>, and its reply comes back here.\n`
+        + '<i>If that session runs in another permission mode, it may wait for you to accept the message there.</i>',
+      buttons: [[{ text: '✖ Cancel', callback_data: 'ss:cancel' }]],
+    });
+    return true;
+  }
+  handleStaleButton(cq);
+  return true;
+}
+
+function fullModeButton(sessionId, messageId, answer) {
+  const clear = () => tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: messageId, reply_markup: { inline_keyboard: [] } }, { lowPriority: true })
+    .catch(e => log(`full mode button: ${e.message}`));
+  if (!state.main || state.sessionId !== sessionId) { answer('⌛ That session is no longer loaded here.'); clear(); return; }
+  if (state.main.mode !== 'plan') { answer('Already in full mode.'); clear(); return; }
+  if (busy) { answer('A task is running; tap again when it is done.'); return; }
+  state.main.mode = null;
+  saveState();
+  closeWarm('full mode');
+  log(`load: full mode for ${state.main.name}`);
+  answer('🔓 Full mode');
+  clear();
+  sendChunked(`🔓 <b>Full mode</b> for <b>${htmlEscape(state.main.name)}</b>: Claude can now make changes in <code>${htmlEscape(state.main.cwd)}</code> without asking first, as in the bot's own chat.`, { mode: 'html' })
+    .catch(e => log(`full mode: ${e.message}`));
+}
+
+const LOAD_PROMPT = '[The user loaded this conversation into the Telegram bot, to continue it from their phone. '
+  + 'This run is read-only. In two to four short lines, say what this conversation is about and where it stands. Do not use tools.]';
+
+// 📥 Load here, run from the queue so it never races a task.
+async function loadSession(target, msgId) {
+  const live = liveSessions().some(s => s.sessionId === target.sessionId);
+  const file = claudeSessions.findTranscript(target.sessionId, target.cwd);
+  const cwd = (file && claudeSessions.transcriptCwd(claudeSessions.readTail(file, 256 * 1024))) || target.cwd;
+  if (!file || !cwd || !fs.existsSync(cwd)) {
+    await sendChunked(`⚠️ Could not load <b>${htmlEscape(target.name)}</b>: ${!file ? 'its conversation file was not found' : 'its folder no longer exists'}.`, { mode: 'html', replyTo: msgId });
+    return;
+  }
+  const stopTyping = startTyping();
+  let handle = null, res;
+  try {
+    res = await claudeRaw(LOAD_PROMPT, live ? ['--resume', target.sessionId, '--fork-session'] : ['--resume', target.sessionId], {
+      cwd, permissionMode: 'plan', replyTo: msgId, onSpawn: (h) => { handle = h; activeTask = h; },
+    });
+  } finally {
+    stopTyping();
+    if (activeTask === handle) activeTask = null;
+  }
+  if (res.stopped) { await sendChunked('⏹ Loading stopped. The bot\'s own chat is unchanged.', { mode: 'html', replyTo: msgId }); return; }
+  let envelope = null; try { envelope = JSON.parse(String(res.out).trim()); } catch (_) {}
+  if (res.code !== 0 || !envelope || envelope.is_error || !envelope.session_id) {
+    log(`load: ${target.sessionId} failed (exit=${res.code}): ${String(res.errOut || res.out).slice(0, 300)}`);
+    await sendChunked(`⚠️ Could not load <b>${htmlEscape(target.name)}</b> (exit ${res.code}). The bot's own chat is unchanged.`, { mode: 'html', replyTo: msgId });
+    return;
+  }
+  recordUsage(envelope, CLAUDE_RUNTIME.model, 'load');
+  closeWarm('loading another session');
+  state.sessionId = envelope.session_id;
+  state.main = { cwd, mode: 'plan', name: target.name, from: target.sessionId };
+  state.lastActivity = new Date().toISOString();
+  state.planNonce = null;
+  saveState();
+  log(`load: ${target.name} (${target.sessionId}) ${live ? 'forked as' : 'continued as'} ${envelope.session_id} in ${cwd}`);
+  const summary = stripAnsi(String(envelope.result || '')).trim();
+  const how = live ? 'a copy; the session itself is not touched' : 'it was no longer running, so this continues it as it is';
+  await sendChunked(`📥 **Loaded ${target.name}** (${how}). Your next message continues it.\n`
+    + `⚠️ **Read-only** for now: Claude can look but not change anything in \`${cwd}\`. Tap 🔓 to allow changes. /new goes back to the bot's own chat.`
+    + (summary && !TG_SENT_SENTINEL.test(summary) ? `\n\n${summary}` : ''), {
+    mode: 'rich', replyTo: msgId, session: envelope.session_id,
+    buttons: [[{ text: '🔓 Full mode: allow changes', callback_data: `ss:full:${envelope.session_id}`, style: 'danger' }]],
+  });
+}
+
+// ✉️ Send message: the warm Claude sends it, so the reply comes back to it.
+async function relayMessage(target, text, msgId) {
+  const live = liveSessions().find(s => s.sessionId === target.sessionId);
+  if (!live || !live.socket) {
+    await sendChunked(`⚠️ <b>${htmlEscape(target.name)}</b> is no longer running, so nothing was sent.`, { mode: 'html', replyTo: msgId });
+    return;
+  }
+  tgReact(msgId, '👀');
+  const prompt = `[Relay from the user in Telegram, not a task for you. Use the SendMessage tool once, to the Claude session "${live.name}": `
+    + `to = uds:${live.socket} (its exact address), notify_when_idle = true, message = the text between the markers below, exactly as written. `
+    + 'Do nothing else. Then reply with one short line: sent, or the error.]\n'
+    + `<<<\n${text}\n>>>`;
+  const sentAt = Date.now();
+  const { ok, text: result } = await runClaude(prompt, { replyTo: msgId, source: 'relay' });
+  const line = stripAnsi(result || '').trim();
+  if (!ok) {
+    await tgReact(msgId, '💔');
+    await sendChunked(`**Not sent** to ${live.name}:\n${line || '(no output)'}`, { mode: 'rich', replyTo: msgId });
+    return;
+  }
+  relay = { ...sessionTarget(live), sentAt, replied: false };
+  log(`relay: message sent to ${live.name} (${live.sessionId}); waiting for its reply`);
+  await tgReact(msgId, '🫡');
+  await sendChunked(`✉️ **To ${live.name}:** ${line && !TG_SENT_SENTINEL.test(line) ? line : 'sent.'}\n_Its reply will come back here._`, { mode: 'rich', replyTo: msgId });
 }
 
 // ---------- Restart recovery ----------
@@ -3203,6 +3507,11 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
       await sendChunked(view.text, { mode: 'html', replyTo: m.message_id, buttons: view.buttons }).catch(e => log(`search reply: ${e.message}`));
       return;
     }
+    if (parsed && parsed.command === 'sessions') {
+      const view = sessionsView();
+      await sendChunked(view.text, { mode: 'html', replyTo: m.message_id, buttons: view.buttons }).catch(e => log(`sessions reply: ${e.message}`));
+      return;
+    }
     if (parsed && (parsed.command === 'remind' || parsed.command === 'every')) {
       tgReact(m.message_id, '🫡');
       await sendChunked(scheduleCommand(parsed.command, parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`schedule reply: ${e.message}`));
@@ -3226,6 +3535,12 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
       try { handshake.handOffToAsk(m); log(`handed message ${m.message_id} to the waiting asker`); return; }
       catch (e) { log(`handoff: ${e.message}`); }
     }
+  }
+  // ✉️ Send message was tapped: this text goes to that session instead.
+  if (relayDraft && !ownMedia && !parsed && text) {
+    const target = relayDraft;
+    relayDraft = null;
+    if (Date.now() - target.at <= RELAY_DRAFT_TTL_MS) { enqueue({ text, msgId: m.message_id, relayTo: target }); return; }
   }
   const media = ownMedia || repliedMedia;
   // A reply to a bot answer from another conversation continues there (see runForkTask).
@@ -3269,7 +3584,7 @@ async function pollLoop() {
       else if (u.callback_query && !fromOwner(u.callback_query.from)) {
         tgApi('answerCallbackQuery', { callback_query_id: u.callback_query.id, text: 'Only the bot owner can use these buttons.' }).catch(() => {});
         log(`ignored button tap from user ${u.callback_query.from && u.callback_query.from.id}`);
-      } else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query) && !sentryButton(u.callback_query) && !resumeButton(u.callback_query)) await handleStaleButton(u.callback_query);
+      } else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query) && !sentryButton(u.callback_query) && !resumeButton(u.callback_query) && !sessionsButton(u.callback_query)) await handleStaleButton(u.callback_query);
     }
   }
 }
@@ -3341,7 +3656,7 @@ function previousStop() {
 // turn wins: its boundary records the size the summary left behind.
 function sessionContextTokens(sessionId) {
   try {
-    const file = path.join(PROJECT_DIR, `${sessionId}.jsonl`);
+    const file = transcriptFile(sessionId);
     const size = fs.statSync(file).size;
     const fd = fs.openSync(file, 'r');
     const len = Math.min(size, 512 * 1024);
